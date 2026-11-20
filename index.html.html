@@ -888,12 +888,42 @@ function flush(){
   for(const [k,v] of Object.entries(pending))applyRemoteSection(k,v);
 }
 document.addEventListener('focusout',()=>setTimeout(flush,0),true);
-let reconnecting=false;
+let reconnecting=false,listenerRetryTimer=0,listenerRetryDelay=3000,heartbeatTimer=0,serverConfirmedAt=0;
+function hasLocalChanges(){return Object.values(localDirty).some(Boolean)}
+function scheduleListenerReconnect(error){
+  const code=String(error?.code||'').toLowerCase();
+  // 權限／設定錯誤不靠重連解決，避免無限重試；網路型錯誤則自動重掛監聽。
+  if(code.includes('permission-denied')||code.includes('unauthenticated')||code.includes('invalid-argument'))return;
+  if(listenerRetryTimer)return;
+  listenerRetryTimer=setTimeout(()=>{
+    listenerRetryTimer=0;
+    if(navigator.onLine&&auth?.currentUser&&cloudApi){
+      rebindTripSync();
+      verifyCloudConnection();
+    }
+  },listenerRetryDelay);
+  listenerRetryDelay=Math.min(listenerRetryDelay*2,30000);
+}
+async function verifyCloudConnection(){
+  if(!navigator.onLine){setSync('local');return false;}
+  if(!cloudApi?.tripRef||!cloudApi.getDocFromServer)return false;
+  try{
+    await cloudApi.getDocFromServer(cloudApi.tripRef);
+    serverConfirmedAt=Date.now();listenerRetryDelay=3000;
+    if(cloudReady){
+      if(hasLocalChanges())push();
+      else setSync('live');
+    }
+    return true;
+  }catch(e){reportFirebaseError(e,'Firestore 連線檢查');scheduleListenerReconnect(e);return false;}
+}
 window.addEventListener('online',()=>{
-  if(cloudReady){setSync('wait');push();}
+  if(cloudReady){setSync('wait');verifyCloudConnection().then(()=>push());}
   else if(FB_ON&&!auth?.currentUser&&!reconnecting){reconnecting=true;syncErrorShown=false;initSync().finally(()=>{reconnecting=false;});}
+  else if(FB_ON&&auth?.currentUser){setSync('wait');rebindTripSync();verifyCloudConnection();}
 });
 window.addEventListener('offline',()=>setSync('local'));
+window.addEventListener('visibilitychange',()=>{if(!document.hidden&&FB_ON&&auth?.currentUser)verifyCloudConnection();});
 function push(){
   if(!cloudApi||!cloudReady||!ui.unlocked)return;
   clearTimeout(pushTimer);
@@ -910,22 +940,24 @@ function push(){
         lastCloud[k]=json;localDirty[k]=false;
       })());
     }
-    if(!jobs.length){setSync('live');return}
+    if(!jobs.length){if(serverConfirmedAt&&Date.now()-serverConfirmedAt<90000)setSync('live');else{setSync('wait');verifyCloudConnection()}return}
     setSync('wait');
     try{await Promise.all(jobs);setSync('live')}
     catch(e){reportFirebaseError(e,'Firestore 寫入');setTimeout(push,8000)}
   },250);
 }
-function stopTripListeners(){
+function stopTripListeners(preserveLocal=false){
   cloudUnsubs.forEach(fn=>{try{fn()}catch(e){}});
   cloudUnsubs=[];cloudReady=false;
-  lastCloud={meta:'',days:'',todo:'',prep:'',pack:'',notes:''};
+  if(!preserveLocal){
+    lastCloud={meta:'',days:'',todo:'',prep:'',pack:'',notes:''};
+    localDirty={meta:false,days:false,todo:false,prep:false,pack:false,notes:false};
+  }
   deferredSections={};
-  localDirty={meta:false,days:false,todo:false,prep:false,pack:false,notes:false};
 }
 function rebindTripSync(){
   if(!cloudApi||!auth?.currentUser)return;
-  stopTripListeners();
+  stopTripListeners(true);
   const id=shareTripId,tripRef=cloudApi.doc(cloudDb,'trips',id);
   const sectionRefs={};
   for(const k of SECTION_KEYS){if(k!=='meta')sectionRefs[k]=cloudApi.doc(cloudDb,'trips',id,'sections',k)}
@@ -934,23 +966,31 @@ function rebindTripSync(){
   SECTION_KEYS.forEach(k=>{received[k]=false});
   const refs={meta:tripRef,...sectionRefs};
   for(const k of SECTION_KEYS){
-    const unsub=cloudApi.onSnapshot(refs[k],snap=>{
+    const unsub=cloudApi.onSnapshot(refs[k],{includeMetadataChanges:true},snap=>{
       const raw=snap.exists()?snap.data():null;
       const data=raw?cleanSection(k,raw):null;
       if(data)applyRemoteSection(k,data);
-      // 線上時等伺服器快照確認後才判定文件不存在，避免把本機舊資料誤當初始值覆蓋雲端。
-      if(snap.metadata?.fromCache&&navigator.onLine)return;
+      // 開啟 includeMetadataChanges 後，快取快照轉成伺服器快照時也會通知；
+      // 線上但仍是 cache 時不能宣稱同步完成。
+      if(snap.metadata?.fromCache){if(!navigator.onLine)setSync('local');else if(syncState==='live')setSync('wait');return;}
+      serverConfirmedAt=Date.now();listenerRetryDelay=3000;
       received[k]=true;existsBySection[k]=!!data;dataBySection[k]=data;
-      if(SECTION_KEYS.every(name=>received[name])&&!cloudReady){
-        cloudReady=true;
-        for(const name of SECTION_KEYS)lastCloud[name]=existsBySection[name]?JSON.stringify(dataBySection[name]):'';
-        setSync('wait');push();
-        if(SECTION_KEYS.every(name=>existsBySection[name]))setSync('live');
+      if(SECTION_KEYS.every(name=>received[name])){
+        if(!cloudReady){
+          cloudReady=true;
+          for(const name of SECTION_KEYS)lastCloud[name]=existsBySection[name]?JSON.stringify(dataBySection[name]):'';
+          setSync('wait');push();
+        }
+        if(!hasLocalChanges()&&SECTION_KEYS.every(name=>existsBySection[name]))setSync('live');
       }
-      if(snap.metadata?.fromCache&&!navigator.onLine)setSync('local');
-    },err=>{reportFirebaseError(err,'Firestore 即時監聽');});
+    },err=>{
+      reportFirebaseError(err,'Firestore 即時監聽');
+      scheduleListenerReconnect(err);
+    });
     cloudUnsubs.push(unsub);
   }
+  if(heartbeatTimer)clearInterval(heartbeatTimer);
+  heartbeatTimer=setInterval(()=>{if(!document.hidden)verifyCloudConnection();},45000);
 }
 async function initSync(){
   if(!FB_ON){setSync('local');return}
@@ -977,7 +1017,7 @@ async function initSync(){
         if(e.code!=='failed-precondition'&&e.code!=='unimplemented')console.warn('Firestore persistence:',e);
       }
     }
-    cloudApi={doc:Store.doc,setDoc:Store.setDoc,onSnapshot:Store.onSnapshot,getDoc:Store.getDoc};
+    cloudApi={doc:Store.doc,setDoc:Store.setDoc,onSnapshot:Store.onSnapshot,getDoc:Store.getDoc,getDocFromServer:Store.getDocFromServer};
     PH={
       set:async(id,data)=>{
         try{localStorage.setItem('tabi-photo-'+id,data)}catch(e){}
